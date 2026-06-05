@@ -57,6 +57,22 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  // Idempotent auto top-up so the account can cover MBR + opt-in costs. Safe to
+  // call on every login/restore — ensureFunded is a no-op once funded.
+  const ensureToppedUp = useCallback(async (addr: string) => {
+    try {
+      const res = await fetch("/api/faucet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address: addr }),
+      });
+      const data = await res.json();
+      if (res.ok) setTopUp({ funded: data.funded, amount: data.amountFunded });
+    } catch {
+      /* top-up failure is non-fatal; surfaced via balance */
+    }
+  }, []);
+
   // Restore an existing session on mount if the user is already logged in.
   useEffect(() => {
     let cancelled = false;
@@ -70,6 +86,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
           setAccount(acct);
           setAddress(addr);
           addressRef.current = addr;
+          await ensureToppedUp(addr);
           await refreshBalance();
         }
       } catch {
@@ -81,7 +98,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [refreshBalance]);
+  }, [refreshBalance, ensureToppedUp]);
 
   const connect = useCallback(async () => {
     setConnecting(true);
@@ -107,17 +124,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       }
 
       // Automatic top-up so the new account can cover MBR + opt-in costs.
-      try {
-        const res = await fetch("/api/faucet", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ address: addr }),
-        });
-        const data = await res.json();
-        if (res.ok) setTopUp({ funded: data.funded, amount: data.amountFunded });
-      } catch {
-        /* top-up failure is non-fatal; surfaced via balance */
-      }
+      await ensureToppedUp(addr);
 
       await refreshBalance();
     } catch (err) {
@@ -125,7 +132,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setConnecting(false);
     }
-  }, [refreshBalance]);
+  }, [refreshBalance, ensureToppedUp]);
 
   const logout = useCallback(async () => {
     try {
