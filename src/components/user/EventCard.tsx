@@ -4,10 +4,11 @@ import { CalendarDays, Check, ExternalLink, Loader2, MapPin } from "lucide-react
 import { Artwork } from "@/components/Artwork";
 import { CurrencyBadge } from "@/components/Logo";
 import { useWallet } from "@/components/WalletProvider";
+import { UsdcTutorial } from "@/components/user/UsdcTutorial";
 import { explorerTxUrl } from "@/lib/algod";
 import { formatPrice } from "@/lib/constants";
 import { formatEventDate } from "@/lib/format";
-import { purchaseTicket } from "@/lib/purchase-client";
+import { NeedsUsdcError, purchaseTicket } from "@/lib/purchase-client";
 import type { TicketEvent } from "@/lib/types";
 
 export function EventCard({
@@ -19,6 +20,8 @@ export function EventCard({
 }) {
   const { account, connect, ready } = useWallet();
   const [busy, setBusy] = useState(false);
+  const [stage, setStage] = useState<string | null>(null);
+  const [needUsdc, setNeedUsdc] = useState<{ address: string; needed: number } | null>(null);
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string; txId?: string } | null>(null);
 
   const remaining = event.totalTickets - event.ticketsSold;
@@ -31,20 +34,31 @@ export function EventCard({
       return;
     }
     setBusy(true);
+    setStage(null);
     try {
-      const result = await purchaseTicket(account, {
-        id: event.id,
-        assetId: event.assetId!,
-        organizerAddress: event.organizerAddress!,
-        price: event.price,
-        currency: event.currency,
-      });
+      const result = await purchaseTicket(
+        account,
+        {
+          id: event.id,
+          assetId: event.assetId!,
+          organizerAddress: event.organizerAddress!,
+          price: event.price,
+          currency: event.currency,
+        },
+        setStage,
+      );
+      setNeedUsdc(null);
       setMsg({ kind: "ok", text: "You got a ticket! 🎟️", txId: result.txId });
       onPurchased();
     } catch (err) {
-      setMsg({ kind: "err", text: err instanceof Error ? err.message : "Purchase failed" });
+      if (err instanceof NeedsUsdcError) {
+        setNeedUsdc({ address: err.address, needed: err.neededUsdc });
+      } else {
+        setMsg({ kind: "err", text: err instanceof Error ? err.message : "Purchase failed" });
+      }
     } finally {
       setBusy(false);
+      setStage(null);
     }
   }
 
@@ -87,12 +101,13 @@ export function EventCard({
         <button className="btn-primary w-full" disabled={busy || soldOut || !ready} onClick={buy}>
           {busy ? (
             <>
-              <Loader2 className="h-4 w-4 animate-spin" /> Processing…
+              <Loader2 className="h-4 w-4 animate-spin" />
+              {stage ?? "Processing…"}
             </>
           ) : soldOut ? (
             "Sold out"
           ) : account ? (
-            "Buy ticket"
+            `Buy with ${event.currency}`
           ) : (
             "Sign in to buy"
           )}
@@ -119,6 +134,15 @@ export function EventCard({
           </p>
         )}
       </div>
+
+      {needUsdc && (
+        <UsdcTutorial
+          address={needUsdc.address}
+          neededUsdc={needUsdc.needed}
+          onRetry={buy}
+          onClose={() => setNeedUsdc(null)}
+        />
+      )}
     </div>
   );
 }

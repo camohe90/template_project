@@ -43,6 +43,8 @@ export default function MyTicketsPage() {
     load();
   }, [load]);
 
+  const totalTickets = tickets.reduce((n, t) => n + t.count, 0);
+
   if (ready && !account) {
     return (
       <div className="card flex flex-col items-center gap-4 p-16 text-center">
@@ -71,6 +73,23 @@ export default function MyTicketsPage() {
           <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /> Refresh
         </button>
       </div>
+
+      {tickets.length > 0 && (
+        <div className="flex flex-wrap gap-4">
+          <div className="card flex items-center gap-4 px-5 py-4">
+            <span className="text-3xl font-bold text-brand-700">{totalTickets}</span>
+            <span className="text-sm text-slate-500">
+              ticket{totalTickets === 1 ? "" : "s"} purchased
+            </span>
+          </div>
+          <div className="card flex items-center gap-4 px-5 py-4">
+            <span className="text-3xl font-bold text-brand-700">{tickets.length}</span>
+            <span className="text-sm text-slate-500">
+              event{tickets.length === 1 ? "" : "s"}
+            </span>
+          </div>
+        </div>
+      )}
 
       {loading && tickets.length === 0 ? (
         <p className="text-sm text-slate-500">Loading your tickets…</p>

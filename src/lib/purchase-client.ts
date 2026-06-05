@@ -8,6 +8,28 @@ function bytesToB64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+/**
+ * Thrown when a USDC purchase can't proceed because the buyer lacks test USDC
+ * and the demo faucet couldn't cover them. The UI uses this to show a tutorial.
+ * By the time this is thrown the buyer is already opted in to USDC, so they can
+ * receive tokens from Circle's faucet immediately.
+ */
+export class NeedsUsdcError extends Error {
+  address: string;
+  neededUsdc: number;
+  haveUsdc: number;
+  constructor(address: string, neededUsdc: number, haveUsdc: number) {
+    super("Not enough test USDC");
+    this.name = "NeedsUsdcError";
+    this.address = address;
+    this.neededUsdc = neededUsdc;
+    this.haveUsdc = haveUsdc;
+  }
+}
+
+/** Optional progress reporter for the multi-step purchase flow. */
+export type StageReporter = (message: string) => void;
+
 /** Base-unit balance of an asset for an address (0 if not opted in). */
 async function assetBalance(address: string, assetId: number): Promise<bigint> {
   try {
@@ -23,20 +45,27 @@ async function isOptedIn(address: string, assetId: number): Promise<boolean> {
   return (info.assets ?? []).some((a) => Number(a.assetId) === assetId);
 }
 
-/** Opt an account in to an asset (0-amount self transfer). */
-async function optIn(account: algosdk.Account, assetId: number): Promise<void> {
+/**
+ * Opt the account in to one or more assets in a single signed step (grouped
+ * atomically when there is more than one). No-op when `assetIds` is empty.
+ */
+async function optInAssets(account: algosdk.Account, assetIds: number[]): Promise<void> {
+  if (assetIds.length === 0) return;
   const algod = getAlgodClient();
   const suggestedParams = await algod.getTransactionParams().do();
-  const txn = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
-    sender: account.addr,
-    receiver: account.addr,
-    assetIndex: BigInt(assetId),
-    amount: 0,
-    suggestedParams,
-  });
-  const signed = txn.signTxn(account.sk);
+  const txns = assetIds.map((id) =>
+    algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
+      sender: account.addr,
+      receiver: account.addr,
+      assetIndex: BigInt(id),
+      amount: 0,
+      suggestedParams,
+    }),
+  );
+  if (txns.length > 1) algosdk.assignGroupID(txns);
+  const signed = txns.map((t) => t.signTxn(account.sk));
   await algod.sendRawTransaction(signed).do();
-  await algosdk.waitForConfirmation(algod, txn.txID(), 6);
+  await algosdk.waitForConfirmation(algod, txns[0].txID(), 6);
 }
 
 export interface PurchaseTarget {
@@ -55,79 +84,84 @@ export interface PurchaseResult {
   ticketsSold: number;
 }
 
-/** Ensure the buyer holds enough USDC, opting in and using the faucet if needed. */
-async function ensureUsdc(account: algosdk.Account, priceBase: bigint): Promise<void> {
+/** Ensure the buyer has enough USDC, using the faucet if needed (assumes opted in). */
+async function ensureUsdcBalance(
+  account: algosdk.Account,
+  priceBase: bigint,
+  onStage?: StageReporter,
+): Promise<void> {
   const buyer = account.addr.toString();
-
-  if (!(await isOptedIn(buyer, USDC_ASSET_ID))) {
-    await optIn(account, USDC_ASSET_ID);
-  }
-
   let balance = await assetBalance(buyer, USDC_ASSET_ID);
   if (balance >= priceBase) return;
 
-  // Top up from the demo faucet (best effort), then re-check.
+  onStage?.("Topping up test USDC…");
   const shortfallUsdc = Number(priceBase - balance) / 1_000_000;
   const res = await fetch("/api/usdc-faucet", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ address: buyer, amount: Math.max(shortfallUsdc, 10) }),
   });
-  const data = await res.json().catch(() => ({}));
+
   if (!res.ok) {
-    throw new Error(
-      data.error ??
-        "You don't have enough test USDC. Get some from Circle's TestNet faucet (faucet.circle.com).",
-    );
+    throw new NeedsUsdcError(buyer, Number(priceBase) / 1_000_000, Number(balance) / 1_000_000);
   }
 
   balance = await assetBalance(buyer, USDC_ASSET_ID);
   if (balance < priceBase) {
-    throw new Error("Test USDC top-up did not arrive in time. Please try again.");
+    throw new NeedsUsdcError(buyer, Number(priceBase) / 1_000_000, Number(balance) / 1_000_000);
   }
 }
 
 /**
  * Build the atomic [payment, ticket-transfer] group, sign the payment leg in
- * the browser, and hand the rest to the server (which signs + submits). Handles
- * both ALGO and USDC events, opting the buyer in to the ticket ASA (and USDC)
- * as needed.
+ * the browser, and hand the rest to the server (which signs + submits).
+ *
+ * All required opt-ins (the ticket ASA, plus USDC for USDC events) are done
+ * once, in a single step, at the start of the purchase. Reports progress via
+ * `onStage`.
  */
 export async function purchaseTicket(
   account: algosdk.Account,
   event: PurchaseTarget,
+  onStage?: StageReporter,
 ): Promise<PurchaseResult> {
   const buyer = account.addr.toString();
   const algod = getAlgodClient();
+  const usdcEvent = event.currency === "USDC";
   const priceBase = toBaseUnits(event.price, event.currency);
 
-  // Opt in to the ticket asset so the buyer can receive it.
-  if (!(await isOptedIn(buyer, event.assetId))) {
-    await optIn(account, event.assetId);
+  // Single opt-in step: opt in to whatever the buyer still needs (USDC for
+  // USDC events + the ticket ASA), grouped into one signed transaction.
+  const toOptIn: number[] = [];
+  if (usdcEvent && !(await isOptedIn(buyer, USDC_ASSET_ID))) toOptIn.push(USDC_ASSET_ID);
+  if (!(await isOptedIn(buyer, event.assetId))) toOptIn.push(event.assetId);
+  if (toOptIn.length) {
+    onStage?.("Setting up your account…");
+    await optInAssets(account, toOptIn);
   }
 
-  // For USDC events, make sure the buyer holds enough USDC.
-  if (event.currency === "USDC") {
-    await ensureUsdc(account, priceBase);
+  // For USDC events, make sure the buyer actually holds enough USDC.
+  if (usdcEvent) {
+    await ensureUsdcBalance(account, priceBase, onStage);
   }
 
+  onStage?.("Awaiting your signature…");
   const suggestedParams = await algod.getTransactionParams().do();
 
-  const paymentLeg =
-    event.currency === "USDC"
-      ? algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
-          sender: account.addr,
-          receiver: event.organizerAddress,
-          assetIndex: BigInt(USDC_ASSET_ID),
-          amount: priceBase,
-          suggestedParams,
-        })
-      : algosdk.makePaymentTxnWithSuggestedParamsFromObject({
-          sender: account.addr,
-          receiver: event.organizerAddress,
-          amount: priceBase,
-          suggestedParams,
-        });
+  const paymentLeg = usdcEvent
+    ? algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
+        sender: account.addr,
+        receiver: event.organizerAddress,
+        assetIndex: BigInt(USDC_ASSET_ID),
+        amount: priceBase,
+        suggestedParams,
+      })
+    : algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+        sender: account.addr,
+        receiver: event.organizerAddress,
+        amount: priceBase,
+        suggestedParams,
+      });
 
   const ticketAxfer = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
     sender: event.organizerAddress,
@@ -140,6 +174,7 @@ export async function purchaseTicket(
   algosdk.assignGroupID([paymentLeg, ticketAxfer]);
   const signedPayment = paymentLeg.signTxn(account.sk);
 
+  onStage?.("Finalizing on Algorand…");
   const res = await fetch("/api/purchase", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
