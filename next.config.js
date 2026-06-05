@@ -1,6 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // Hide the floating Next.js dev-tools indicator (dev only).
+  devIndicators: false,
   // This app is self-contained; pin the file-tracing root to silence the
   // "inferred workspace root" warning caused by lockfiles in parent folders.
   outputFileTracingRoot: __dirname,
