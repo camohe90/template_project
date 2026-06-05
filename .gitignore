@@ -8,3 +8,4 @@ out
 next-env.d.ts.timestamp
 # local JSON datastore (demo only)
 data/events.json
+data/uploads/

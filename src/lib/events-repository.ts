@@ -22,10 +22,21 @@ const DATA_FILE = path.join(DATA_DIR, "events.json");
 // Serialize writes within a single server process to avoid lost updates.
 let writeChain: Promise<unknown> = Promise.resolve();
 
+/** Backfill fields for records written by older versions of the app. */
+function normalize(raw: Record<string, unknown>): TicketEvent {
+  const legacyPrice = typeof raw.priceAlgo === "number" ? raw.priceAlgo : undefined;
+  return {
+    ...(raw as unknown as TicketEvent),
+    price: typeof raw.price === "number" ? raw.price : (legacyPrice ?? 0),
+    currency: raw.currency === "USDC" ? "USDC" : "ALGO",
+  };
+}
+
 async function readAll(): Promise<TicketEvent[]> {
   try {
     const raw = await fs.readFile(DATA_FILE, "utf8");
-    return JSON.parse(raw) as TicketEvent[];
+    const parsed = JSON.parse(raw) as Record<string, unknown>[];
+    return parsed.map(normalize);
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw err;
@@ -37,14 +48,15 @@ async function writeAll(events: TicketEvent[]): Promise<void> {
   await fs.writeFile(DATA_FILE, JSON.stringify(events, null, 2), "utf8");
 }
 
-function mutate<T>(fn: (events: TicketEvent[]) => Promise<{ events: TicketEvent[]; result: T }>): Promise<T> {
+function mutate<T>(
+  fn: (events: TicketEvent[]) => Promise<{ events: TicketEvent[]; result: T }>,
+): Promise<T> {
   const next = writeChain.then(async () => {
     const events = await readAll();
     const { events: updated, result } = await fn(events);
     await writeAll(updated);
     return result;
   });
-  // keep the chain alive even if this op rejects
   writeChain = next.catch(() => undefined);
   return next;
 }
@@ -68,7 +80,8 @@ export async function createEvent(input: CreateEventInput): Promise<TicketEvent>
     date: input.date,
     imageUrl: input.imageUrl,
     totalTickets: input.totalTickets,
-    priceAlgo: input.priceAlgo,
+    price: input.price,
+    currency: input.currency,
     status: "draft",
     ticketsSold: 0,
     createdAt: new Date().toISOString(),
@@ -81,7 +94,8 @@ export async function createEvent(input: CreateEventInput): Promise<TicketEvent>
 
 export async function updateEvent(
   id: string,
-  patch: UpdateEventInput & Partial<Pick<TicketEvent, "assetId" | "organizerAddress" | "status">>,
+  patch: UpdateEventInput &
+    Partial<Pick<TicketEvent, "assetId" | "organizerAddress" | "status">>,
 ): Promise<TicketEvent | undefined> {
   return mutate(async (events) => {
     const idx = events.findIndex((e) => e.id === id);

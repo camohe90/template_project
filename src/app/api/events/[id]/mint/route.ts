@@ -1,10 +1,18 @@
 import { NextResponse } from "next/server";
 import { getEvent, updateEvent } from "@/lib/events-repository";
-import { getAlgorand, getOrganizer } from "@/lib/server-algorand";
+import { ensureOptedIn, getAlgorand, getOrganizer } from "@/lib/server-algorand";
+import { USDC_ASSET_ID } from "@/lib/constants";
 
 export const runtime = "nodejs";
 
 type Ctx = { params: Promise<{ id: string }> };
+
+/** ASA URLs are capped at 96 bytes — only attach the artwork URL if it fits. */
+function assetUrlFor(imageUrl: string | undefined, origin: string): string | undefined {
+  if (!imageUrl) return undefined;
+  const abs = imageUrl.startsWith("http") ? imageUrl : `${origin}${imageUrl}`;
+  return abs.length <= 96 ? abs : undefined;
+}
 
 /**
  * Mint the ticket inventory for an event as a single ASA.
@@ -15,7 +23,7 @@ type Ctx = { params: Promise<{ id: string }> };
  * destroyed later, and leave `freeze`/`clawback` unset so holders can freely
  * transfer their tickets.
  */
-export async function POST(_req: Request, { params }: Ctx) {
+export async function POST(req: Request, { params }: Ctx) {
   const { id } = await params;
   const event = await getEvent(id);
   if (!event) return NextResponse.json({ error: "Not found" }, { status: 404 });
@@ -30,6 +38,12 @@ export async function POST(_req: Request, { params }: Ctx) {
     const algorand = getAlgorand();
     const organizer = getOrganizer();
 
+    // For USDC-priced events the organizer must hold USDC to receive payments.
+    if (event.currency === "USDC") {
+      await ensureOptedIn(organizer, USDC_ASSET_ID);
+    }
+
+    const origin = new URL(req.url).origin;
     const assetName = event.name.slice(0, 32);
     const result = await algorand.send.assetCreate({
       sender: organizer.addr,
@@ -37,7 +51,7 @@ export async function POST(_req: Request, { params }: Ctx) {
       decimals: 0,
       assetName,
       unitName: "TICKET",
-      url: event.imageUrl || undefined,
+      url: assetUrlFor(event.imageUrl, origin),
       manager: organizer.addr,
       reserve: organizer.addr,
       defaultFrozen: false,

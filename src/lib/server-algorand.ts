@@ -63,3 +63,31 @@ export function userTopUpAlgo(): number {
   const raw = Number(process.env.NEXT_PUBLIC_USER_TOPUP_ALGO ?? "1");
   return Number.isFinite(raw) && raw > 0 ? raw : 1;
 }
+
+/** Idempotently opt an account in to an asset (no-op if already opted in). */
+export async function ensureOptedIn(
+  account: SignerAccount,
+  assetId: number,
+): Promise<void> {
+  const algorand = getAlgorand();
+  try {
+    await algorand.client.algod
+      .accountAssetInformation(account.addr.toString(), assetId)
+      .do();
+    return; // already opted in
+  } catch {
+    await algorand.send.assetOptIn({ sender: account.addr, assetId: BigInt(assetId) });
+  }
+}
+
+/** Current asset balance (base units) held by an address; 0 if not opted in. */
+export async function assetBalance(address: string, assetId: number): Promise<bigint> {
+  try {
+    const info = await getAlgorand()
+      .client.algod.accountAssetInformation(address, assetId)
+      .do();
+    return BigInt(info.assetHolding?.amount ?? 0);
+  } catch {
+    return 0n;
+  }
+}

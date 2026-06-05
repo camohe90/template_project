@@ -22,7 +22,8 @@ export async function POST(req: Request) {
   const date = body.date?.trim();
   const description = body.description?.trim() ?? "";
   const totalTickets = Number(body.totalTickets);
-  const priceAlgo = Number(body.priceAlgo);
+  const price = Number(body.price);
+  const currency = body.currency === "USDC" ? "USDC" : "ALGO";
 
   if (!name || !venue || !date) {
     return NextResponse.json(
@@ -36,9 +37,9 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
-  if (!Number.isFinite(priceAlgo) || priceAlgo < 0) {
+  if (!Number.isFinite(price) || price < 0) {
     return NextResponse.json(
-      { error: "priceAlgo must be a non-negative number" },
+      { error: "price must be a non-negative number" },
       { status: 400 },
     );
   }
@@ -49,7 +50,8 @@ export async function POST(req: Request) {
     date,
     description,
     totalTickets,
-    priceAlgo,
+    price,
+    currency,
     imageUrl: body.imageUrl?.trim() || undefined,
   });
 

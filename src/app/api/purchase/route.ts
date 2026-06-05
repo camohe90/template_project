@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import algosdk from "algosdk";
 import { getEvent, incrementSold } from "@/lib/events-repository";
 import { getAlgorand, getOrganizer } from "@/lib/server-algorand";
+import { USDC_ASSET_ID, toBaseUnits } from "@/lib/constants";
 
 export const runtime = "nodejs";
 
@@ -9,8 +10,10 @@ export const runtime = "nodejs";
  * Atomic ticket purchase.
  *
  * The client builds a 2-transaction atomic group:
- *   [0] payment  : buyer -> organizer  (ticket price in microAlgos)
- *   [1] axfer    : organizer -> buyer  (1 ticket unit of the event ASA)
+ *   [0] payment leg : buyer -> organizer  (ticket price)
+ *                     - ALGO events: a payment transaction
+ *                     - USDC events: a USDC asset-transfer transaction
+ *   [1] ticket axfer: organizer -> buyer  (1 ticket unit of the event ASA)
  *
  * The buyer signs txn[0] in the browser (Web3Auth key). The organizer's half
  * (txn[1]) can only be signed server-side, so the client posts its signed
@@ -58,7 +61,7 @@ export async function POST(req: Request) {
   const algorand = getAlgorand();
   const organizer = getOrganizer();
   const organizerAddr = organizer.addr.toString();
-  const expectedPrice = BigInt(Math.round(event.priceAlgo * 1_000_000));
+  const expectedPrice = toBaseUnits(event.price, event.currency);
 
   // Decode both halves of the group.
   let payTxn: algosdk.Transaction;
@@ -72,14 +75,19 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Could not decode transactions" }, { status: 400 });
   }
 
-  // Validate the payment leg.
-  if (
-    payTxn.sender.toString() !== buyerAddress ||
-    payTxn.payment?.receiver.toString() !== organizerAddr ||
-    payTxn.payment?.amount !== expectedPrice
-  ) {
+  // Validate the payment leg — shape depends on the event currency.
+  const payValid =
+    payTxn.sender.toString() === buyerAddress &&
+    (event.currency === "USDC"
+      ? payTxn.assetTransfer?.receiver.toString() === organizerAddr &&
+        payTxn.assetTransfer?.assetIndex === BigInt(USDC_ASSET_ID) &&
+        payTxn.assetTransfer?.amount === expectedPrice
+      : payTxn.payment?.receiver.toString() === organizerAddr &&
+        payTxn.payment?.amount === expectedPrice);
+
+  if (!payValid) {
     return NextResponse.json(
-      { error: "Payment transaction does not match the ticket price" },
+      { error: `Payment transaction does not match the ${event.currency} ticket price` },
       { status: 400 },
     );
   }

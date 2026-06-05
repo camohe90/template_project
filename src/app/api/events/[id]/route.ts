@@ -45,7 +45,8 @@ export async function PATCH(req: Request, { params }: Ctx) {
   if (body.venue !== undefined) patch.venue = String(body.venue).trim();
   if (body.date !== undefined) patch.date = String(body.date).trim();
   if (body.imageUrl !== undefined) patch.imageUrl = String(body.imageUrl).trim();
-  if (body.priceAlgo !== undefined) patch.priceAlgo = Number(body.priceAlgo);
+  if (body.price !== undefined) patch.price = Number(body.price);
+  if (body.currency !== undefined) patch.currency = body.currency === "USDC" ? "USDC" : "ALGO";
   if (body.status !== undefined) patch.status = body.status;
 
   const event = await updateEvent(id, patch);

@@ -1,5 +1,6 @@
 import algosdk from "algosdk";
 import { getAlgodClient } from "./algod";
+import { USDC_ASSET_ID, toBaseUnits, type Currency } from "./constants";
 
 function bytesToB64(bytes: Uint8Array): string {
   let binary = "";
@@ -7,15 +8,23 @@ function bytesToB64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-/** Returns true if the address already holds (is opted in to) the asset. */
-export async function isOptedIn(address: string, assetId: number): Promise<boolean> {
-  const algod = getAlgodClient();
-  const info = await algod.accountInformation(address).do();
+/** Base-unit balance of an asset for an address (0 if not opted in). */
+async function assetBalance(address: string, assetId: number): Promise<bigint> {
+  try {
+    const info = await getAlgodClient().accountAssetInformation(address, assetId).do();
+    return BigInt(info.assetHolding?.amount ?? 0);
+  } catch {
+    return 0n;
+  }
+}
+
+async function isOptedIn(address: string, assetId: number): Promise<boolean> {
+  const info = await getAlgodClient().accountInformation(address).do();
   return (info.assets ?? []).some((a) => Number(a.assetId) === assetId);
 }
 
-/** Opt the buyer in to the ticket ASA (required before they can receive one). */
-export async function optIn(account: algosdk.Account, assetId: number): Promise<string> {
+/** Opt an account in to an asset (0-amount self transfer). */
+async function optIn(account: algosdk.Account, assetId: number): Promise<void> {
   const algod = getAlgodClient();
   const suggestedParams = await algod.getTransactionParams().do();
   const txn = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
@@ -28,14 +37,14 @@ export async function optIn(account: algosdk.Account, assetId: number): Promise<
   const signed = txn.signTxn(account.sk);
   await algod.sendRawTransaction(signed).do();
   await algosdk.waitForConfirmation(algod, txn.txID(), 6);
-  return txn.txID();
 }
 
 export interface PurchaseTarget {
   id: string;
   assetId: number;
   organizerAddress: string;
-  priceAlgo: number;
+  price: number;
+  currency: Currency;
 }
 
 export interface PurchaseResult {
@@ -46,10 +55,43 @@ export interface PurchaseResult {
   ticketsSold: number;
 }
 
+/** Ensure the buyer holds enough USDC, opting in and using the faucet if needed. */
+async function ensureUsdc(account: algosdk.Account, priceBase: bigint): Promise<void> {
+  const buyer = account.addr.toString();
+
+  if (!(await isOptedIn(buyer, USDC_ASSET_ID))) {
+    await optIn(account, USDC_ASSET_ID);
+  }
+
+  let balance = await assetBalance(buyer, USDC_ASSET_ID);
+  if (balance >= priceBase) return;
+
+  // Top up from the demo faucet (best effort), then re-check.
+  const shortfallUsdc = Number(priceBase - balance) / 1_000_000;
+  const res = await fetch("/api/usdc-faucet", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ address: buyer, amount: Math.max(shortfallUsdc, 10) }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      data.error ??
+        "You don't have enough test USDC. Get some from Circle's TestNet faucet (faucet.circle.com).",
+    );
+  }
+
+  balance = await assetBalance(buyer, USDC_ASSET_ID);
+  if (balance < priceBase) {
+    throw new Error("Test USDC top-up did not arrive in time. Please try again.");
+  }
+}
+
 /**
- * Build the atomic [payment, asset-transfer] group, sign the payment leg in the
- * browser, and hand the rest to the server (which signs + submits). Opts the
- * buyer in first if necessary.
+ * Build the atomic [payment, ticket-transfer] group, sign the payment leg in
+ * the browser, and hand the rest to the server (which signs + submits). Handles
+ * both ALGO and USDC events, opting the buyer in to the ticket ASA (and USDC)
+ * as needed.
  */
 export async function purchaseTicket(
   account: algosdk.Account,
@@ -57,22 +99,37 @@ export async function purchaseTicket(
 ): Promise<PurchaseResult> {
   const buyer = account.addr.toString();
   const algod = getAlgodClient();
+  const priceBase = toBaseUnits(event.price, event.currency);
 
+  // Opt in to the ticket asset so the buyer can receive it.
   if (!(await isOptedIn(buyer, event.assetId))) {
     await optIn(account, event.assetId);
   }
 
+  // For USDC events, make sure the buyer holds enough USDC.
+  if (event.currency === "USDC") {
+    await ensureUsdc(account, priceBase);
+  }
+
   const suggestedParams = await algod.getTransactionParams().do();
-  const priceMicroAlgos = BigInt(Math.round(event.priceAlgo * 1_000_000));
 
-  const payment = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
-    sender: account.addr,
-    receiver: event.organizerAddress,
-    amount: priceMicroAlgos,
-    suggestedParams,
-  });
+  const paymentLeg =
+    event.currency === "USDC"
+      ? algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
+          sender: account.addr,
+          receiver: event.organizerAddress,
+          assetIndex: BigInt(USDC_ASSET_ID),
+          amount: priceBase,
+          suggestedParams,
+        })
+      : algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+          sender: account.addr,
+          receiver: event.organizerAddress,
+          amount: priceBase,
+          suggestedParams,
+        });
 
-  const axfer = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
+  const ticketAxfer = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
     sender: event.organizerAddress,
     receiver: account.addr,
     assetIndex: BigInt(event.assetId),
@@ -80,9 +137,8 @@ export async function purchaseTicket(
     suggestedParams,
   });
 
-  algosdk.assignGroupID([payment, axfer]);
-
-  const signedPayment = payment.signTxn(account.sk);
+  algosdk.assignGroupID([paymentLeg, ticketAxfer]);
+  const signedPayment = paymentLeg.signTxn(account.sk);
 
   const res = await fetch("/api/purchase", {
     method: "POST",
@@ -91,7 +147,7 @@ export async function purchaseTicket(
       eventId: event.id,
       buyerAddress: buyer,
       signedPaymentTxn: bytesToB64(signedPayment),
-      unsignedAxferTxn: bytesToB64(algosdk.encodeUnsignedTransaction(axfer)),
+      unsignedAxferTxn: bytesToB64(algosdk.encodeUnsignedTransaction(ticketAxfer)),
     }),
   });
 
